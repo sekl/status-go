@@ -2,6 +2,9 @@ package api
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 
 	gethcommon "github.com/ethereum/go-ethereum/common"
@@ -23,9 +26,9 @@ const (
 
 // StatusBackend implements Status.im service
 type StatusBackend struct {
-	sync.Mutex
+	mu              sync.Mutex
 	nodeReady       chan struct{} // channel to wait for when node is fully ready
-	nodeManager     common.NodeManager
+	nodeManager     *node.NodeManager
 	accountManager  common.AccountManager
 	txQueueManager  *transactions.Manager
 	jailManager     common.JailManager
@@ -77,43 +80,65 @@ func (m *StatusBackend) IsNodeRunning() bool {
 }
 
 // StartNode start Status node, fails if node is already started
-func (m *StatusBackend) StartNode(config *params.NodeConfig) (<-chan struct{}, error) {
-	m.Lock()
-	defer m.Unlock()
+func (m *StatusBackend) StartNode(config *params.NodeConfig) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.startNode(config)
+}
 
-	if m.nodeReady != nil {
-		return nil, node.ErrNodeExists
-	}
-
-	nodeStarted, err := m.nodeManager.StartNode(config)
+func (m *StatusBackend) startNode(config *params.NodeConfig) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("node crashed on start: %v", err)
+		}
+	}()
+	err = m.nodeManager.StartNode(config)
 	if err != nil {
-		return nil, err
+		switch err.(type) {
+		case node.RPCClientError:
+			signal.Send(signal.Envelope{
+				Type: signal.EventNodeCrashed,
+				Event: signal.NodeCrashEvent{
+					Error: node.ErrRPCClient.Error(),
+				},
+			})
+		case node.EthNodeError:
+			signal.Send(signal.Envelope{
+				Type: signal.EventNodeCrashed,
+				Event: signal.NodeCrashEvent{
+					Error: fmt.Errorf("%v: %v", node.ErrNodeStartFailure, err).Error(),
+				},
+			})
+		default:
+			signal.Send(signal.Envelope{
+				Type: signal.EventNodeCrashed,
+				Event: signal.NodeCrashEvent{
+					Error: err.Error(),
+				},
+			})
+		}
+		return err
 	}
-
-	m.nodeReady = make(chan struct{}, 1)
-	go m.onNodeStart(nodeStarted, m.nodeReady) // waits on nodeStarted, writes to backendReady
-
-	return m.nodeReady, err
+	signal.Send(signal.Envelope{
+		Type:  signal.EventNodeStarted,
+		Event: struct{}{},
+	})
+	m.onNodeStart()
+	return nil
 }
 
 // onNodeStart does everything required to prepare backend
-func (m *StatusBackend) onNodeStart(nodeStarted <-chan struct{}, backendReady chan struct{}) {
-	<-nodeStarted
-
+func (m *StatusBackend) onNodeStart() {
 	// tx queue manager should be started after node is started, it depends
 	// on rpc client being created
 	m.txQueueManager.Start()
-
 	if err := m.registerHandlers(); err != nil {
 		log.Error("Handler registration failed", "err", err)
 	}
-
 	if err := m.accountManager.ReSelectAccount(); err != nil {
 		log.Error("Reselect account failed", "err", err)
 	}
 	log.Info("Account reselected")
-
-	close(backendReady)
 	signal.Send(signal.Envelope{
 		Type:  signal.EventNodeReady,
 		Event: struct{}{},
@@ -121,76 +146,80 @@ func (m *StatusBackend) onNodeStart(nodeStarted <-chan struct{}, backendReady ch
 }
 
 // StopNode stop Status node. Stopped node cannot be resumed.
-func (m *StatusBackend) StopNode() (<-chan struct{}, error) {
-	m.Lock()
-	defer m.Unlock()
+func (m *StatusBackend) StopNode() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.stopNode()
+}
 
-	if m.nodeReady == nil {
-		return nil, node.ErrNoRunningNode
+func (m *StatusBackend) stopNode() error {
+	if !m.IsNodeRunning() {
+		return node.ErrNoRunningNode
 	}
-	<-m.nodeReady
-
 	m.txQueueManager.Stop()
 	m.jailManager.Stop()
-
-	nodeStopped, err := m.nodeManager.StopNode()
+	err := m.nodeManager.StopNode()
 	if err != nil {
-		return nil, err
+		return err
 	}
-
-	backendStopped := make(chan struct{}, 1)
-	go func() {
-		<-nodeStopped
-		m.Lock()
-		m.nodeReady = nil
-		m.Unlock()
-		close(backendStopped)
-	}()
-
-	return backendStopped, nil
+	signal.Send(signal.Envelope{
+		Type:  signal.EventNodeStopped,
+		Event: struct{}{},
+	})
+	return nil
 }
 
 // RestartNode restart running Status node, fails if node is not running
-func (m *StatusBackend) RestartNode() (<-chan struct{}, error) {
-	m.Lock()
-	defer m.Unlock()
-
-	if m.nodeReady == nil {
-		return nil, node.ErrNoRunningNode
+func (m *StatusBackend) RestartNode() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.IsNodeRunning() {
+		return node.ErrNoRunningNode
 	}
-	<-m.nodeReady
-
-	nodeRestarted, err := m.nodeManager.RestartNode()
+	config, err := m.nodeManager.NodeConfig()
 	if err != nil {
-		return nil, err
+		return err
 	}
-
-	m.nodeReady = make(chan struct{}, 1)
-	go m.onNodeStart(nodeRestarted, m.nodeReady) // waits on nodeRestarted, writes to backendReady
-
-	return m.nodeReady, err
+	newcfg := *config
+	if err := m.stopNode(); err != nil {
+		return err
+	}
+	if err := m.startNode(&newcfg); err != nil {
+		return err
+	}
+	return err
 }
 
 // ResetChainData remove chain data from data directory.
 // Node is stopped, and new node is started, with clean data directory.
-func (m *StatusBackend) ResetChainData() (<-chan struct{}, error) {
-	m.Lock()
-	defer m.Unlock()
-
-	if m.nodeReady == nil {
-		return nil, node.ErrNoRunningNode
-	}
-	<-m.nodeReady
-
-	nodeReset, err := m.nodeManager.ResetChainData()
+func (m *StatusBackend) ResetChainData() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	config, err := m.nodeManager.NodeConfig()
 	if err != nil {
-		return nil, err
+		return err
 	}
-
-	m.nodeReady = make(chan struct{}, 1)
-	go m.onNodeStart(nodeReset, m.nodeReady) // waits on nodeReset, writes to backendReady
-
-	return m.nodeReady, err
+	newcfg := *config
+	if err := m.stopNode(); err != nil {
+		return err
+	}
+	chainDataDir := filepath.Join(config.DataDir, config.Name, "lightchaindata")
+	if _, err := os.Stat(chainDataDir); os.IsNotExist(err) {
+		// is it really an error, if we want to remove it as next step?
+		return err
+	}
+	if err := os.RemoveAll(chainDataDir); err != nil {
+		return err
+	}
+	log.Info("Chain data has been removed", "dir", chainDataDir)
+	signal.Send(signal.Envelope{
+		Type:  signal.EventChainDataRemoved,
+		Event: struct{}{},
+	})
+	if err := m.startNode(&newcfg); err != nil {
+		return err
+	}
+	return err
 }
 
 // CallRPC executes RPC request on node's in-proc RPC server
@@ -206,7 +235,6 @@ func (m *StatusBackend) SendTransaction(ctx context.Context, args common.SendTxA
 	}
 
 	tx := common.CreateTransaction(ctx, args)
-
 	if err := m.txQueueManager.QueueTransaction(tx); err != nil {
 		return gethcommon.Hash{}, err
 	}
@@ -244,7 +272,6 @@ func (m *StatusBackend) registerHandlers() error {
 	if rpcClient == nil {
 		return node.ErrRPCClient
 	}
-
 	rpcClient.RegisterHandler("eth_accounts", m.accountManager.AccountsRPCHandler())
 	rpcClient.RegisterHandler("eth_sendTransaction", m.txQueueManager.SendTransactionRPCHandler)
 	return nil

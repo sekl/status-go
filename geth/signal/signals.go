@@ -9,8 +9,9 @@ import "C"
 import (
 	"encoding/json"
 
-	"github.com/status-im/status-go/geth/log"
 	"sync"
+
+	"github.com/status-im/status-go/geth/log"
 )
 
 const (

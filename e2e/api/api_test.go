@@ -1,6 +1,7 @@
 package api_test
 
 import (
+	"encoding/json"
 	"io/ioutil"
 	"math/rand"
 	"os"
@@ -11,7 +12,9 @@ import (
 	"github.com/status-im/status-go/e2e"
 	"github.com/status-im/status-go/geth/api"
 	"github.com/status-im/status-go/geth/log"
+	"github.com/status-im/status-go/geth/node"
 	"github.com/status-im/status-go/geth/params"
+	"github.com/status-im/status-go/geth/signal"
 	. "github.com/status-im/status-go/testing"
 	"github.com/stretchr/testify/suite"
 )
@@ -27,6 +30,12 @@ func TestAPI(t *testing.T) {
 type APITestSuite struct {
 	suite.Suite
 	api *api.StatusAPI
+}
+
+func (s *APITestSuite) ensureNodeStopped() {
+	if err := s.api.StopNode(); err != node.ErrNoRunningNode && err != nil {
+		s.NoError(err, "unexpected error")
+	}
 }
 
 func (s *APITestSuite) SetupTest() {
@@ -117,7 +126,7 @@ func (s *APITestSuite) TestRaceConditions() {
 
 	time.Sleep(2 * time.Second) // so that we see some logs
 	// just in case we have a node running
-	s.api.StopNode() //nolint: errcheck
+	s.ensureNodeStopped()
 }
 
 func (s *APITestSuite) TestCellsRemovedAfterSwitchAccount() {
@@ -185,4 +194,55 @@ func (s *APITestSuite) TestLogoutRemovesCells() {
 
 	_, err = s.api.JailManager().Cell(testChatID)
 	require.Error(err, "Expected that cells was removed")
+}
+
+func (s *APITestSuite) TestNodeStartCrash() {
+	// let's listen for node.crashed signal
+	signalReceived := make(chan struct{})
+	signal.SetDefaultNodeNotificationHandler(func(jsonEvent string) {
+		var envelope signal.Envelope
+		err := json.Unmarshal([]byte(jsonEvent), &envelope)
+		s.NoError(err)
+
+		if envelope.Type == signal.EventNodeCrashed {
+			close(signalReceived)
+		}
+	})
+	defer signal.ResetDefaultNodeNotificationHandler()
+
+	nodeConfig, err := e2e.MakeTestNodeConfig(GetNetworkID())
+	s.NoError(err)
+
+	// start node outside the manager (on the same port), so that manager node.Start() method fails
+	outsideNode, err := node.MakeNode(nodeConfig)
+	s.NoError(err)
+	err = outsideNode.Start()
+	s.NoError(err)
+
+	// now try starting using node manager
+	startChan, err := s.api.StartNodeAsync(nodeConfig)
+	s.NoError(err) // no error is thrown, as node is started in separate routine
+	s.NoError(WaitClosed(startChan, 500*time.Millisecond))
+
+	select {
+	case <-time.After(500 * time.Millisecond):
+		s.FailNow("timed out waiting for signal")
+	case <-signalReceived:
+	}
+
+	// stop outside node, and re-try
+	s.NoError(outsideNode.Stop())
+	signalReceived = make(chan struct{})
+	startChan, err = s.api.StartNodeAsync(nodeConfig)
+	s.NoError(err) // again, no error
+	s.NoError(WaitClosed(startChan, 500*time.Millisecond))
+
+	select {
+	case <-time.After(500 * time.Millisecond):
+	case <-signalReceived:
+		s.FailNow("signal should not be received")
+	}
+
+	// cleanup
+	s.NoError(s.api.StopNode())
 }

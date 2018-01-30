@@ -8,7 +8,6 @@ import (
 	"os/signal"
 	"runtime"
 	"strings"
-	"time"
 
 	"github.com/status-im/status-go/cmd/statusd/debug"
 	"github.com/status-im/status-go/geth/api"
@@ -72,7 +71,7 @@ func main() {
 	}
 
 	backend := api.NewStatusBackend()
-	started, err := backend.StartNode(config)
+	err = backend.StartNode(config)
 	if err != nil {
 		log.Fatalf("Node start failed: %v", err)
 		return
@@ -80,10 +79,6 @@ func main() {
 
 	// handle interrupt signals
 	go haltOnInterruptSignal(backend.NodeManager())
-
-	// wait till node is started
-	<-started
-
 	// Check if debugging CLI connection shall be enabled.
 	if *cliEnabled {
 		err := startDebug(backend)
@@ -217,16 +212,9 @@ func haltOnInterruptSignal(nodeManager common.NodeManager) {
 
 	log.Println("Got interrupt, shutting down...")
 
-	nodeStopped, err := nodeManager.StopNode()
+	err := nodeManager.StopNode()
 	if err != nil {
 		log.Printf("Failed to stop node: %v", err.Error())
-		os.Exit(1)
-	}
-
-	select {
-	case <-nodeStopped:
-	case <-time.After(time.Second * 5):
-		log.Printf("Stopping node timed out")
 		os.Exit(1)
 	}
 }

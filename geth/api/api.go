@@ -8,6 +8,7 @@ import (
 	gethcommon "github.com/ethereum/go-ethereum/common"
 	"github.com/status-im/status-go/geth/common"
 	"github.com/status-im/status-go/geth/log"
+	"github.com/status-im/status-go/geth/node"
 	"github.com/status-im/status-go/geth/params"
 	"github.com/status-im/status-go/geth/transactions"
 )
@@ -52,65 +53,88 @@ func (api *StatusAPI) TxQueueManager() *transactions.Manager {
 
 // StartNode start Status node, fails if node is already started
 func (api *StatusAPI) StartNode(config *params.NodeConfig) error {
-	nodeStarted, err := api.b.StartNode(config)
-	if err != nil {
-		return err
-	}
-	<-nodeStarted
-	return nil
+	return api.b.StartNode(config)
 }
 
 // StartNodeAsync start Status node, fails if node is already started
 // Returns immediately w/o waiting for node to start (see node.ready)
 func (api *StatusAPI) StartNodeAsync(config *params.NodeConfig) (<-chan struct{}, error) {
-	return api.b.StartNode(config)
+	resp := make(chan struct{})
+	if api.b.IsNodeRunning() {
+		close(resp)
+		return resp, nil
+	}
+	go func() {
+		api.StartNode(config) // nolint: errcheck
+		close(resp)
+	}()
+	return resp, nil
 }
 
 // StopNode stop Status node. Stopped node cannot be resumed.
 func (api *StatusAPI) StopNode() error {
-	nodeStopped, err := api.b.StopNode()
-	if err != nil {
-		return err
-	}
-	<-nodeStopped
-	return nil
+	return api.b.StopNode()
 }
 
 // StopNodeAsync stop Status node. Stopped node cannot be resumed.
 // Returns immediately, w/o waiting for node to stop (see node.stopped)
 func (api *StatusAPI) StopNodeAsync() (<-chan struct{}, error) {
-	return api.b.StopNode()
+	// this is stub, will be replaced
+	resp := make(chan struct{})
+	if !api.b.IsNodeRunning() {
+		// nil or node.ErrNoRunningNode ?
+		close(resp)
+		return resp, nil
+	}
+	go func() {
+		api.StopNode() // nolint: errcheck
+		close(resp)
+	}()
+	return resp, nil
 }
 
 // RestartNode restart running Status node, fails if node is not running
 func (api *StatusAPI) RestartNode() error {
-	nodeStarted, err := api.b.RestartNode()
-	if err != nil {
-		return err
-	}
-	<-nodeStarted // do not return up until backend is ready
-	return nil
+	return api.b.RestartNode()
 }
 
 // RestartNodeAsync restart running Status node, in async manner
 func (api *StatusAPI) RestartNodeAsync() (<-chan struct{}, error) {
-	return api.b.RestartNode()
+	// this is stub, will be replaced
+	resp := make(chan struct{})
+	if !api.b.IsNodeRunning() {
+		close(resp)
+		// error is returned because we can't start a node with a config
+		// and config is usually removed when node was stopped
+		return resp, node.ErrNoRunningNode
+	}
+	go func() {
+		api.RestartNode() // nolint: errcheck
+		close(resp)
+	}()
+	return resp, nil
 }
 
 // ResetChainData remove chain data from data directory.
 // Node is stopped, and new node is started, with clean data directory.
 func (api *StatusAPI) ResetChainData() error {
-	nodeStarted, err := api.b.ResetChainData()
-	if err != nil {
-		return err
-	}
-	<-nodeStarted // do not return up until backend is ready
-	return nil
+	return api.b.ResetChainData()
 }
 
 // ResetChainDataAsync remove chain data from data directory, in async manner
 func (api *StatusAPI) ResetChainDataAsync() (<-chan struct{}, error) {
-	return api.b.ResetChainData()
+	resp := make(chan struct{})
+	if !api.b.IsNodeRunning() {
+		close(resp)
+		// error is returned because we can't start a node with a config
+		// and config is usually removed when node was stopped
+		return resp, node.ErrNoRunningNode
+	}
+	go func() {
+		api.ResetChainData() // nolint: errcheck
+		close(resp)
+	}()
+	return resp, nil
 }
 
 // CallRPC executes RPC request on node's in-proc RPC server
